@@ -306,11 +306,148 @@ def validate(root, package, check_pins=True):
     return task, manifest
 
 
+_WINDOWS_GATE = r"""
+import ctypes
+from ctypes import wintypes
+import json
+import subprocess
+import sys
+api = ctypes.WinDLL('kernel32', use_last_error=True)
+api.OpenEventW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+api.OpenEventW.restype = wintypes.HANDLE
+api.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+api.WaitForSingleObject.restype = wintypes.DWORD
+api.CloseHandle.argtypes = [wintypes.HANDLE]
+api.CloseHandle.restype = wintypes.BOOL
+event = api.OpenEventW(0x00100000, False, sys.argv[1])
+if not event:
+    raise ctypes.WinError(ctypes.get_last_error())
+try:
+    if api.WaitForSingleObject(event, 30000) != 0:
+        raise RuntimeError('replay ownership gate was not released')
+finally:
+    api.CloseHandle(event)
+# No verification command or descendant starts until the parent owns this job.
+sys.exit(subprocess.call(json.loads(sys.argv[2])))
+"""
+
+def run_windows_command(argv, cwd, timeout, env):
+    """Own ordinary verification descendants even after their leader exits.
+
+    The gated launcher joins a kill-on-close Job Object before it may spawn
+    the requested command. A late taskkill cannot recover an exited leader's
+    tree. Job handles are not inherited and breakaway is not enabled.
+    """
+    import ctypes
+    from ctypes import wintypes
+    import time
+    import uuid
+
+    class BasicLimits(ctypes.Structure):
+        _fields_ = [("ProcessTime", ctypes.c_int64), ("JobTime", ctypes.c_int64),
+                    ("Flags", wintypes.DWORD), ("MinWorkingSet", ctypes.c_size_t),
+                    ("MaxWorkingSet", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t), ("Priority", wintypes.DWORD),
+                    ("Scheduling", wintypes.DWORD)]
+
+    class IOCounts(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_uint64) for name in
+                    ("ReadOps", "WriteOps", "OtherOps", "ReadBytes", "WriteBytes", "OtherBytes")]
+
+    class ExtendedLimits(ctypes.Structure):
+        _fields_ = [("Basic", BasicLimits), ("IO", IOCounts),
+                    ("ProcessMemory", ctypes.c_size_t), ("JobMemory", ctypes.c_size_t),
+                    ("PeakProcessMemory", ctypes.c_size_t), ("PeakJobMemory", ctypes.c_size_t)]
+
+    class Accounting(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_int64) for name in
+                    ("UserTime", "KernelTime", "PeriodUserTime", "PeriodKernelTime")] + [
+                    (name, wintypes.DWORD) for name in
+                    ("PageFaults", "TotalProcesses", "ActiveProcesses", "TerminatedProcesses")]
+
+    api = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    def native(name, result, *arguments):
+        fn = getattr(api, name)
+        fn.restype, fn.argtypes = result, arguments
+        return fn
+
+    handle, dword, boolean = wintypes.HANDLE, wintypes.DWORD, wintypes.BOOL
+    create_job = native("CreateJobObjectW", handle, ctypes.c_void_p, wintypes.LPCWSTR)
+    set_info = native("SetInformationJobObject", boolean, handle, ctypes.c_int, ctypes.c_void_p, dword)
+    assign = native("AssignProcessToJobObject", boolean, handle, handle)
+    terminate = native("TerminateJobObject", boolean, handle, wintypes.UINT)
+    query = native("QueryInformationJobObject", boolean, handle, ctypes.c_int,
+                   ctypes.c_void_p, dword, ctypes.c_void_p)
+    create_event = native("CreateEventW", handle, ctypes.c_void_p, boolean, boolean, wintypes.LPCWSTR)
+    set_event = native("SetEvent", boolean, handle)
+    close = native("CloseHandle", boolean, handle)
+
+    def checked(ok):
+        if not ok:
+            raise ctypes.WinError(ctypes.get_last_error())
+        return ok
+
+    job = checked(create_job(None, None))
+    event, process, assigned = None, None, False
+    try:
+        limits = ExtendedLimits()
+        limits.Basic.Flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        checked(set_info(job, 9, ctypes.byref(limits), ctypes.sizeof(limits)))
+        name = "Local\\research-replay-" + uuid.uuid4().hex
+        event = checked(create_event(None, True, False, name))
+        # A name collision must not attach to an already-signaled event.
+        if ctypes.get_last_error() == 183:
+            raise ValueError("replay ownership gate name already exists")
+        process = subprocess.Popen(
+            # The gate itself must not run sitecustomize/PYTHONPATH startup
+            # code before ownership. The requested command retains env/argv.
+            [sys.executable, "-I", "-S", "-c", _WINDOWS_GATE, name, json.dumps(argv)],
+            cwd=cwd, env=env, start_new_session=True)
+        checked(assign(job, int(process._handle)))
+        assigned = True
+        checked(set_event(event))
+        try:
+            return process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise ValueError("verification timed out") from None
+    finally:
+        try:
+            if process is not None:
+                if assigned:
+                    checked(terminate(job, 1))
+                    # Termination is asynchronous. Require the job to report
+                    # no active processes before releasing its ownership handle.
+                    deadline = time.monotonic() + 10
+                    while True:
+                        state = Accounting()
+                        checked(query(job, 1, ctypes.byref(state), ctypes.sizeof(state), None))
+                        if not state.ActiveProcesses:
+                            break
+                        if time.monotonic() >= deadline:
+                            raise ValueError("verification process cleanup timed out")
+                        time.sleep(0.01)
+                elif process.poll() is None:
+                    # Assignment failed before the gate opened: no command child
+                    # exists, so only this known gated launcher needs stopping.
+                    process.kill()
+                process.wait(timeout=10)
+        finally:
+            try:
+                if event:
+                    checked(close(event))
+            finally:
+                checked(close(job))
+
 def run_command(argv, cwd, timeout):
     # Assertion checks must not disappear because of the caller's environment.
     # Keep explicit manifest options (including deliberate -O controls) intact.
     env = os.environ.copy()
     env.pop("PYTHONOPTIMIZE", None)
+    if os.name == "nt":
+        code = run_windows_command(argv, cwd, timeout, env)
+        require(code == 0, f"verification command exited {code}")
+        return
     # Own a group for POSIX cleanup of this command and its descendants.
     process = subprocess.Popen(argv, cwd=cwd, env=env, start_new_session=True)
     try:
